@@ -1,0 +1,12 @@
+{
+  "actorOutputSchemaVersion": 1,
+  "title": "MCP server",
+  "properties": {
+    "mcpEndpoint": {
+      "type": "string",
+      "title": "MCP endpoint",
+      "description": "Streamable HTTP endpoint for MCP clients.",
+      "template": "{{run.containerUrl}}/mcp"
+    }
+  }
+}

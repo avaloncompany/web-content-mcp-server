@@ -1,0 +1,7 @@
+{
+  "title": "Web Content & URL Tools MCP Server",
+  "description": "No input is needed. Connect your MCP client to the Standby URL (see README).",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {}
+}

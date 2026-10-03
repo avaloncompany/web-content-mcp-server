@@ -1,0 +1,12 @@
+{
+  "page-tool": {
+    "eventTitle": "Page tool call",
+    "eventDescription": "One successful call to a page tool: to_markdown, get_metadata, extract_structure, detect_technologies, audit_seo, check_broken_links or check_email_domain.",
+    "eventPriceUsd": 0.003
+  },
+  "check-tool": {
+    "eventTitle": "Check tool call",
+    "eventDescription": "One successful call to a check tool: trace_redirects, check_ssl, grade_security_headers, parse_robots, parse_sitemap, lookup_domain, read_feed, analyze_saml_metadata, check_oidc_provider, the developer tools (cron, regex, color, unicode, time zone) or the Hyperliquid market data tools.",
+    "eventPriceUsd": 0.001
+  }
+}

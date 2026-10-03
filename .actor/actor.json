@@ -1,0 +1,12 @@
+{
+  "actorSpecification": 1,
+  "name": "web-content-url-tools-mcp",
+  "title": "Web Content & URL Tools MCP Server",
+  "description": "MCP server for AI agents: web pages to Markdown and metadata, tech stack, redirects, SSL, security headers, robots, sitemaps, feeds, domains, SEO, email auth (SPF, DMARC, DKIM) and SSO (SAML, OIDC) checks, plus cron, regex, color, time zone tools and Hyperliquid data.",
+  "version": "1.0",
+  "usesStandbyMode": true,
+  "webServerMcpPath": "/mcp",
+  "dockerfile": "../Dockerfile",
+  "input": "./input_schema.json",
+  "output": "./output_schema.json"
+}
