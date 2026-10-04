@@ -8,15 +8,20 @@ from __future__ import annotations
 import asyncio
 import os
 
+from typing import Annotated
+
 import httpx
 import uvicorn
 from apify import Actor
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 API_BASE = os.environ.get("WCAPI_BASE", "https://api.avaloncompany.ai")
+#: 웹 도구 공통 인자. 모듈 최상단에 둬야 한다 -- annotations 가 지연 평가라 함수 안 별칭은 풀리지 않는다.
+URL = Annotated[str, Field(description="Full public http(s) URL of the page, e.g. https://example.com/blog/post")]
 TIMEOUT = 60.0
 
 
@@ -50,183 +55,365 @@ async def _call(path: str, params: dict, event: str | None, *, body: bool = Fals
 
 
 def build_server() -> FastMCP:
-    server = FastMCP(name="web-content-url-tools")
+    server = FastMCP(
+        name="web-content-url-tools",
+        instructions=(
+            "Read-only tools for AI agents. Web tools fetch one public http/https page (no JavaScript rendering, "
+            "private/internal addresses refused). Developer tools compute locally. Hyperliquid tools read public market "
+            "data. Failed calls return an error with a reason and are not charged."),
+    )
+    # 도구 정의 품질(목적·사용 시점·동작·파라미터 의미)이 디렉터리 점수와 에이전트의 도구 선택을 좌우한다.
+    # 모든 도구가 읽기 전용이고, 웹 도구만 외부 사이트에 접속한다.
+    web = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+    local = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 
-    @server.tool()
-    async def to_markdown(url: str, include_links: bool = True, include_tables: bool = True,
-                          main_content_only: bool = True) -> dict:
-        """Convert a web page into clean, LLM-ready Markdown (navigation, ads and footers removed).
-        Returns title, markdown, word_count, character_count, language and a warning when the
-        page needs JavaScript to render."""
+    # ── Page tools: read one page ──
+    @server.tool(title="Web page to Markdown", annotations=web)
+    async def to_markdown(
+        url: URL,
+        include_links: Annotated[bool, Field(description="Keep hyperlinks as [text](url) in the Markdown")] = True,
+        include_tables: Annotated[bool, Field(description="Keep HTML tables as Markdown tables")] = True,
+        main_content_only: Annotated[bool, Field(description="Drop navigation, ads, sidebars and footers; set false to keep the whole page")] = True,
+    ) -> dict:
+        """Read a web page as clean, LLM-ready Markdown.
+
+        Use this to read or summarise an article, doc or product page. For only the title, description and
+        preview image use get_metadata; for headings/links/tables as JSON use extract_structure.
+        Returns: title, markdown, word_count, character_count, language, and a warning when the page needs
+        JavaScript to render (its static HTML has little text).
+        Behavior: fetches the URL once (no JavaScript, max 5 MB, ~1-10 s). Sites that block bots return
+        target_blocked. Cost: $0.003 per successful call; errors are free."""
         return await _call("/v1/markdown", {"url": url, "include_links": include_links,
                                             "include_tables": include_tables,
                                             "main_content_only": main_content_only}, "page-tool")
 
-    @server.tool()
-    async def get_metadata(url: str) -> dict:
-        """Get a page's title, description, preview image, site name, canonical URL, favicon,
-        language, author, publish time and Open Graph / Twitter tags."""
+    @server.tool(title="URL metadata and Open Graph", annotations=web)
+    async def get_metadata(url: URL) -> dict:
+        """Get a page's link-preview metadata without its body text.
+
+        Use this to build a link preview or check how a URL will look when shared. For the full text use
+        to_markdown.
+        Returns: title, description, preview image, site name, type, canonical URL, favicon, language,
+        author, published time, keywords, Twitter card type, theme color and JSON-LD types (Open Graph and
+        Twitter tags are used where present).
+        Behavior: fetches the URL once (no JavaScript). Cost: $0.003 per successful call; errors are free."""
         return await _call("/v1/metadata", {"url": url}, "page-tool")
 
-    @server.tool()
-    async def extract_structure(url: str) -> dict:
-        """Extract a page's heading outline, links (internal/external), images, tables and JSON-LD."""
+    @server.tool(title="Page structure as JSON", annotations=web)
+    async def extract_structure(url: URL) -> dict:
+        """Extract a page's structure as JSON: heading outline, links, images, tables and JSON-LD.
+
+        Use this to analyse how a page is organised, list its links or pull its tables. For readable text use
+        to_markdown; to test whether its links work use check_broken_links.
+        Returns: headings, links (internal and external), images, tables, JSON-LD objects and counts.
+        Behavior: fetches the URL once (no JavaScript). Cost: $0.003 per successful call; errors are free."""
         return await _call("/v1/extract", {"url": url}, "page-tool")
 
-    @server.tool()
-    async def detect_technologies(url: str) -> dict:
-        """Detect the CMS, framework, e-commerce platform, CDN, analytics and payment tools a
-        website uses, with the evidence for each."""
+    @server.tool(title="Detect website technologies", annotations=web)
+    async def detect_technologies(url: URL) -> dict:
+        """Detect the technology stack behind a website.
+
+        Use this for competitor or lead research: which CMS, framework, e-commerce platform, CDN, analytics,
+        payment and chat tools a site runs (including Korean platforms such as Cafe24 and Naver).
+        Returns: technologies with name, category and the evidence (header, script or meta tag) for each.
+        Behavior: fetches the URL once and inspects HTML and response headers. Cost: $0.003 per successful
+        call; errors are free."""
         return await _call("/v1/tech", {"url": url}, "page-tool")
 
-    @server.tool()
-    async def trace_redirects(url: str) -> dict:
-        """Expand a short link or trace every redirect hop (HTTP and meta refresh) to the final URL."""
-        return await _call("/v1/redirects", {"url": url}, "check-tool")
+    @server.tool(title="SEO audit of a page", annotations=web)
+    async def audit_seo(url: URL) -> dict:
+        """Audit one page's on-page SEO and list what to fix, most important first.
 
-    @server.tool()
-    async def check_ssl(host: str) -> dict:
-        """Check a domain's TLS certificate on port 443: issuer, expiry, days remaining, SANs and
-        whether browsers trust it (with the reason when not)."""
-        return await _call("/v1/ssl", {"host": host}, "check-tool")
-
-    @server.tool()
-    async def grade_security_headers(url: str) -> dict:
-        """Grade a website's HTTP security headers from A+ to F, listing what is missing and why."""
-        return await _call("/v1/security-headers", {"url": url}, "check-tool")
-
-    @server.tool()
-    async def parse_robots(url: str, path: str | None = None, user_agent: str = "*") -> dict:
-        """Parse a site's robots.txt. With `path` (and optional `user_agent`), says whether that path
-        may be crawled."""
-        return await _call("/v1/robots", {"url": url, "path": path, "user_agent": user_agent},
-                           "check-tool")
-
-    @server.tool()
-    async def parse_sitemap(url: str) -> dict:
-        """List the URLs in a sitemap (or the child sitemaps of a sitemap index). Pass a site URL to
-        find the sitemap automatically. Up to 5,000 URLs."""
-        return await _call("/v1/sitemap", {"url": url}, "check-tool")
-
-    @server.tool()
-    async def lookup_domain(domain: str) -> dict:
-        """WHOIS (RDAP) registration data for a domain — registrar, created/expiry dates, age in days,
-        nameservers — plus DNS records and email setup (MX, SPF, DMARC)."""
-        return await _call("/v1/domain", {"domain": domain}, "check-tool")
-
-    @server.tool()
-    async def audit_seo(url: str) -> dict:
-        """On-page SEO audit of a page: 0-100 score, grade and prioritised issues with fixes
-        (title, description, headings, canonical, noindex, alt text, structured data, robots, sitemap)."""
+        Use this to review a page before publishing or to explain low search visibility. It checks one page,
+        not the whole site; for crawl rules use parse_robots, for the URL list use parse_sitemap.
+        Returns: score 0-100, grade, summary, and issues (severity, code, message with the fix) covering title, meta
+        description, headings, canonical, noindex, image alt text, structured data, robots.txt and sitemap.
+        Behavior: fetches the page plus robots.txt and the sitemap. Cost: $0.003 per successful call."""
         return await _call("/v1/seo-audit", {"url": url}, "page-tool")
 
-    @server.tool()
-    async def check_broken_links(url: str, max_links: int = 50, include_external: bool = True) -> dict:
-        """Check the links on a page (up to 100) and report broken, redirected and bot-blocked links."""
+    @server.tool(title="Check links on a page", annotations=web)
+    async def check_broken_links(
+        url: URL,
+        max_links: Annotated[int, Field(ge=1, le=100, description="How many links to test, 1-100")] = 50,
+        include_external: Annotated[bool, Field(description="Also test links to other sites, not just the same site")] = True,
+    ) -> dict:
+        """Find broken links on a page.
+
+        Use this to clean up a page or audit outbound links. To list links without testing them use
+        extract_structure; to follow one URL's redirects use trace_redirects.
+        Returns: links_found, checked, broken_count, broken, redirected, blocked_count (targets that refuse
+        bots, not counted as broken), per-link results with status codes, and not_checked.
+        Behavior: fetches the page, then requests up to max_links links (at most 20 per host). Cost: $0.003
+        per successful call; errors are free."""
         return await _call("/v1/broken-links", {"url": url, "max_links": max_links,
                                                 "include_external": include_external}, "page-tool")
 
-    @server.tool()
-    async def read_feed(url: str) -> dict:
-        """Read an RSS, Atom or RDF feed as JSON (up to 200 items). A website URL finds its feed."""
+    # ── Check tools: one quick check ──
+    @server.tool(title="Trace redirects / unshorten URL", annotations=web)
+    async def trace_redirects(url: Annotated[str, Field(description="URL to follow, including short links such as https://bit.ly/abc")]) -> dict:
+        """Follow every redirect hop of a URL to its final destination.
+
+        Use this to expand a short link, check where a link really goes, or debug redirect chains and loops.
+        Returns: input_url, final_url, final_status_code, redirect_count, the chain of hops (url, status_code,
+        location, type -- HTTP or meta refresh), and flags for loop_detected, too_many_redirects,
+        https_upgrade and domain_changed.
+        Behavior: requests each hop without downloading page bodies. Cost: $0.001 per successful call."""
+        return await _call("/v1/redirects", {"url": url}, "check-tool")
+
+    @server.tool(title="Check SSL/TLS certificate", annotations=web)
+    async def check_ssl(host: Annotated[str, Field(description="Domain or https URL, e.g. example.com (port 443)")]) -> dict:
+        """Check a domain's TLS certificate on port 443.
+
+        Use this to see when a certificate expires or why browsers distrust it. For HTTP security headers use
+        grade_security_headers; for domain registration use lookup_domain.
+        Returns: trusted (with the verification error when not), issuer, subject common name, SANs,
+        valid_from, valid_to, days_remaining, expired, self_signed, signature algorithm, TLS version, cipher
+        and SHA-256 fingerprint.
+        Behavior: opens one TLS connection. Cost: $0.001 per successful call; errors are free."""
+        return await _call("/v1/ssl", {"host": host}, "check-tool")
+
+    @server.tool(title="Grade security headers", annotations=web)
+    async def grade_security_headers(url: URL) -> dict:
+        """Grade a website's HTTP security headers from A+ to F.
+
+        Use this for a quick security posture check of a site. For the certificate itself use check_ssl.
+        Returns: grade, score, each header (HSTS, CSP, X-Frame-Options, X-Content-Type-Options,
+        Referrer-Policy, Permissions-Policy and more) with present/missing and why it matters, plus
+        information-leaking headers and cookies missing Secure/HttpOnly/SameSite.
+        Behavior: one request for the response headers. Cost: $0.001 per successful call."""
+        return await _call("/v1/security-headers", {"url": url}, "check-tool")
+
+    @server.tool(title="Parse robots.txt", annotations=web)
+    async def parse_robots(
+        url: Annotated[str, Field(description="Any URL on the site; its /robots.txt is read")],
+        path: Annotated[str | None, Field(description="Optional path to test, e.g. /private/page")] = None,
+        user_agent: Annotated[str, Field(description="Crawler user agent to test the path for, e.g. Googlebot")] = "*",
+    ) -> dict:
+        """Read a site's robots.txt and optionally test whether a path may be crawled.
+
+        Use this before crawling a site or to debug why a page is not indexed. For the site's URL list use
+        parse_sitemap.
+        Returns: groups of rules per user agent, sitemap URLs, and when path is given: allowed (true/false)
+        with the matching rule.
+        Behavior: fetches /robots.txt once. Cost: $0.001 per successful call; errors are free."""
+        return await _call("/v1/robots", {"url": url, "path": path, "user_agent": user_agent},
+                           "check-tool")
+
+    @server.tool(title="Parse XML sitemap", annotations=web)
+    async def parse_sitemap(url: Annotated[str, Field(description="Sitemap URL, or a site URL to discover the sitemap from robots.txt and common paths")]) -> dict:
+        """List the URLs in a site's XML sitemap.
+
+        Use this to enumerate a site's pages before reading or auditing them. For crawl permissions use
+        parse_robots.
+        Returns: sitemap_url, type (urlset or sitemapindex), count, truncated, and up to 5,000 URLs, or the
+        child sitemaps (loc, lastmod) of an index. Gzip sitemaps are supported.
+        Behavior: fetches the sitemap (discovering it if needed). Cost: $0.001 per successful call."""
+        return await _call("/v1/sitemap", {"url": url}, "check-tool")
+
+    @server.tool(title="Domain WHOIS and DNS lookup", annotations=web)
+    async def lookup_domain(domain: Annotated[str, Field(description="Domain or URL, e.g. example.com")]) -> dict:
+        """Look up a domain's registration (RDAP/WHOIS) and DNS records.
+
+        Use this to check who registered a domain, when it expires or how old it is. For a full email
+        authentication diagnosis use check_email_domain.
+        Returns: registrar, created/updated/expiry dates, age_days, status, nameservers, A/AAAA/MX/NS/TXT/CAA
+        records, and SPF and DMARC strings.
+        Behavior: RDAP and DNS queries only, no web page fetch. Cost: $0.001 per successful call."""
+        return await _call("/v1/domain", {"domain": domain}, "check-tool")
+
+    @server.tool(title="Read RSS/Atom feed", annotations=web)
+    async def read_feed(url: Annotated[str, Field(description="Feed URL, or a website URL to discover its feed")]) -> dict:
+        """Read an RSS, Atom or RDF feed as JSON.
+
+        Use this to get a site's latest posts. Given a normal page URL it finds the feed from the page.
+        Returns: feed_url, type, title, link, updated and up to 200 items (title, link, published, author,
+        summary, id).
+        Behavior: fetches the page and/or the feed. Cost: $0.001 per successful call; errors are free."""
         return await _call("/v1/feed", {"url": url}, "check-tool")
 
-    # ── 개발자 도구 ──
-    @server.tool()
-    async def parse_cron(expression: str, count: int = 5, timezone: str = "UTC",
-                         start: str | None = None) -> dict:
-        """Validate a cron expression (5 or 6 fields, or @daily-style macros), explain it in plain
-        English and list the previous and next run times in an IANA time zone."""
-        return await _call("/v1/cron", {"expression": expression, "count": count, "timezone": timezone,
-                                        "start": start}, "check-tool")
+    # ── Diagnostics ──
+    @server.tool(title="Email domain health check", annotations=web)
+    async def check_email_domain(
+        domain: Annotated[str, Field(description="Domain or email address, e.g. example.com or info@example.com")],
+        dkim_selector: Annotated[str | None, Field(description="Your DKIM selector(s), comma-separated, up to 5 (common selectors are always tried)")] = None,
+    ) -> dict:
+        """Diagnose a domain's email authentication and deliverability setup.
 
-    @server.tool()
-    async def test_regex(pattern: str, text: str, flags: str = "", replacement: str | None = None) -> dict:
-        """Run a regular expression (Python/PCRE syntax) against text: every match with positions and
-        groups, plus a find-and-replace result when `replacement` is given. Flags: i, m, s, x, u.
-        Runaway patterns stop after 0.1 s with an error instead of hanging."""
-        return await _call("/v1/regex", {"pattern": pattern, "text": text, "flags": flags,
-                                         "replacement": replacement}, "check-tool", body=True)
-
-    @server.tool()
-    async def convert_color(color: str) -> dict:
-        """Convert a color (#hex, rgb(), hsl() or CSS name) to HEX, RGB, HSL, HSV and CMYK, with
-        luminance, best text color, contrast against white/black and matching palettes."""
-        return await _call("/v1/color", {"color": color}, "check-tool")
-
-    @server.tool()
-    async def check_color_contrast(foreground: str, background: str) -> dict:
-        """WCAG 2 contrast ratio between two colors with AA/AAA pass/fail for text and UI components."""
-        return await _call("/v1/color/contrast", {"foreground": foreground, "background": background},
-                           "check-tool")
-
-    @server.tool()
-    async def inspect_unicode(text: str) -> dict:
-        """Inspect text character by character (code point, name, category, UTF-8 bytes) with length
-        in code points, graphemes, UTF-8 bytes and UTF-16 units, and NFC/NFD/NFKC/NFKD forms."""
-        return await _call("/v1/unicode", {"text": text}, "check-tool", body=True)
-
-    @server.tool()
-    async def convert_timezone(from_timezone: str, to_timezones: str, time: str | None = None) -> dict:
-        """Convert a time (ISO 8601; now if omitted) from one IANA time zone to others
-        (comma-separated), with offsets, abbreviations and daylight-saving status."""
-        return await _call("/v1/timezone/convert", {"from": from_timezone, "to": to_timezones, "time": time},
-                           "check-tool")
-
-    @server.tool()
-    async def list_timezones(region: str | None = None) -> dict:
-        """List IANA time zone names, optionally only one region (Europe, Asia, America...)."""
-        return await _call("/v1/timezone/list", {"region": region}, "check-tool")
-
-    # ── Hyperliquid 무기한 선물 ──
-    @server.tool()
-    async def hyperliquid_markets(coin: str | None = None, sort: str = "volume", order: str = "desc",
-                                  limit: int = 50) -> dict:
-        """Hyperliquid perpetual markets: mark/oracle price, 24h change, hourly and annualized funding,
-        open interest (coins and USD), 24h volume, max leverage. Filter with `coin` (e.g. "BTC,ETH");
-        sort by volume, open_interest, funding, change or coin."""
-        return await _call("/v1/hyperliquid/markets", {"coin": coin, "sort": sort, "order": order,
-                                                       "limit": limit}, "check-tool")
-
-    @server.tool()
-    async def hyperliquid_funding_history(coin: str, hours: int = 24) -> dict:
-        """Hourly funding rate history for a Hyperliquid perpetual (up to 720 hours) with average,
-        annualized and cumulative rate."""
-        return await _call("/v1/hyperliquid/funding", {"coin": coin, "hours": hours}, "check-tool")
-
-    @server.tool()
-    async def hyperliquid_candles(coin: str, interval: str = "1h", limit: int = 100) -> dict:
-        """OHLCV candles for a Hyperliquid perpetual. Intervals: 1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d 3d 1w;
-        up to 500 candles."""
-        return await _call("/v1/hyperliquid/candles", {"coin": coin, "interval": interval, "limit": limit},
-                           "check-tool")
-
-    # ── 진단 도구 ──
-    @server.tool()
-    async def check_email_domain(domain: str, dkim_selector: str | None = None) -> dict:
-        """Email authentication health check for a domain (or email address): MX, SPF with the
-        10-DNS-lookup limit, DMARC policy and alignment, DKIM keys (common selectors plus up to 5 of
-        yours, comma-separated), MTA-STS, TLS-RPT and BIMI. Each check is pass/warn/fail with fixes,
-        plus a 0-100 score and grade."""
+        Use this when mail lands in spam or before setting up a sending service. For raw DNS/WHOIS use
+        lookup_domain.
+        Returns: score 0-100, grade, and pass/warn/fail with fixes for MX, SPF (including the 10-DNS-lookup
+        limit), DMARC policy and alignment, DKIM keys, MTA-STS, TLS-RPT and BIMI.
+        Behavior: DNS queries plus the MTA-STS policy file. Cost: $0.003 per successful call."""
         return await _call("/v1/email-domain", {"domain": domain, "dkim_selector": dkim_selector}, "page-tool")
 
-    @server.tool()
-    async def analyze_saml_metadata(xml: str | None = None, url: str | None = None) -> dict:
-        """Analyse SAML 2.0 metadata given as XML text or a metadata URL: entity ID, IdP/SP roles,
-        SSO/SLO/ACS endpoints and bindings, NameID formats, signing certificates (expiry, key size,
-        hash) and prioritised issues such as certificates expiring within 45 days or HTTP endpoints."""
+    @server.tool(title="Analyze SAML metadata", annotations=web)
+    async def analyze_saml_metadata(
+        xml: Annotated[str | None, Field(description="SAML 2.0 metadata XML text (give this or url)")] = None,
+        url: Annotated[str | None, Field(description="Public metadata URL (give this or xml)")] = None,
+    ) -> dict:
+        """Analyse SAML 2.0 identity-provider or service-provider metadata.
+
+        Use this when setting up or debugging SSO. Give either the XML or its URL. For OpenID Connect
+        providers use check_oidc_provider.
+        Returns: entity ID, IdP/SP roles, SSO/SLO/ACS endpoints and bindings, NameID formats, signing
+        certificates (expiry, key size, hash) and prioritised issues such as certificates expiring within
+        45 days or plain-HTTP endpoints.
+        Behavior: parses the XML safely (no external entities); fetches the URL when given. Cost: $0.001."""
         if not xml and not url:
             raise ToolError("Provide either xml or url")
         if url:
             return await _call("/v1/saml/metadata", {"url": url}, "check-tool")
         return await _call("/v1/saml/metadata", {}, "check-tool", xml=xml)
 
-    @server.tool()
-    async def check_oidc_provider(issuer: str) -> dict:
-        """Check an OpenID Connect provider from its issuer URL: discovery document, exact issuer
-        match, required fields, HTTPS endpoints, PKCE S256, ID token algorithms ('none' flagged) and
-        the JWKS keys (size, duplicate kid, exposed private material, certificate expiry)."""
+    @server.tool(title="Check OpenID Connect provider", annotations=web)
+    async def check_oidc_provider(issuer: Annotated[str, Field(description="Issuer URL, e.g. https://accounts.google.com")]) -> dict:
+        """Check an OpenID Connect provider's discovery document and signing keys.
+
+        Use this when integrating OIDC login or auditing an identity provider. For SAML use
+        analyze_saml_metadata.
+        Returns: discovery URL, exact issuer match, required fields, HTTPS endpoints, PKCE S256 support,
+        ID-token algorithms ('none' flagged), and JWKS keys (size, duplicate kid, exposed private material,
+        certificate expiry) with issues.
+        Behavior: fetches the discovery document and JWKS. Cost: $0.001 per successful call."""
         return await _call("/v1/oidc", {"issuer": issuer}, "check-tool")
+
+    # ── Developer tools: computed locally, no web access ──
+    @server.tool(title="Explain a cron expression", annotations=local)
+    async def parse_cron(
+        expression: Annotated[str, Field(description="Cron expression: 5 fields (min hour day month weekday), 6 with seconds, or @daily/@hourly/@weekly/@monthly/@yearly")],
+        count: Annotated[int, Field(ge=1, le=50, description="How many upcoming run times to list, 1-50")] = 5,
+        timezone: Annotated[str, Field(description="IANA time zone for the run times, e.g. America/New_York")] = "UTC",
+        start: Annotated[str | None, Field(description="ISO 8601 date-time to count from; defaults to now")] = None,
+    ) -> dict:
+        """Validate a cron expression, explain it in plain English and list its run times.
+
+        Use this to check a schedule before deploying it or to explain one to a user. Daylight-saving changes
+        are handled like standard cron (fixed-time jobs run once; skipped times move to the next real time).
+        Returns: valid, description, fields, previous_run and next_runs (ISO 8601 with offset).
+        Behavior: computed locally. Cost: $0.001 per successful call; invalid expressions return the reason."""
+        return await _call("/v1/cron", {"expression": expression, "count": count, "timezone": timezone,
+                                        "start": start}, "check-tool")
+
+    @server.tool(title="Test a regular expression", annotations=local)
+    async def test_regex(
+        pattern: Annotated[str, Field(description="Regular expression (Python/PCRE syntax), up to 2,000 characters")],
+        text: Annotated[str, Field(description="Text to search, up to 100,000 characters")],
+        flags: Annotated[str, Field(description="Any of i (ignore case), m (multiline), s (dot matches newline), x (verbose), u (unicode)")] = "",
+        replacement: Annotated[str | None, Field(description="Optional replacement, with \\1 or \\g<name> group references")] = None,
+    ) -> dict:
+        """Run a regular expression against text and show every match.
+
+        Use this to verify a pattern before using it in code or to extract values from text.
+        Returns: valid (or the parser error), match_count, matches (text, start, end, groups, named_groups),
+        and the replaced text when replacement is given.
+        Behavior: computed locally with a time limit, so catastrophic patterns stop in about 0.1 s with an
+        error instead of hanging. Cost: $0.001 per successful call."""
+        return await _call("/v1/regex", {"pattern": pattern, "text": text, "flags": flags,
+                                         "replacement": replacement}, "check-tool", body=True)
+
+    @server.tool(title="Convert a color", annotations=local)
+    async def convert_color(color: Annotated[str, Field(description="Color as #hex, rgb(), hsl() or a CSS name, e.g. #ff6347 or tomato")]) -> dict:
+        """Convert one color between formats and suggest matching palettes.
+
+        Use this for design work: format conversion, picking readable text color or building a palette. To
+        compare two colors for accessibility use check_color_contrast.
+        Returns: hex, rgb, hsl, hsv, cmyk, CSS strings, luminance, best text color, contrast vs white/black,
+        nearest CSS name and palettes (complementary, analogous, triadic, tetradic, shades).
+        Behavior: computed locally. Cost: $0.001 per successful call."""
+        return await _call("/v1/color", {"color": color}, "check-tool")
+
+    @server.tool(title="Check color contrast (WCAG)", annotations=local)
+    async def check_color_contrast(
+        foreground: Annotated[str, Field(description="Text color as #hex, rgb(), hsl() or CSS name")],
+        background: Annotated[str, Field(description="Background color as #hex, rgb(), hsl() or CSS name")],
+    ) -> dict:
+        """Check whether a text/background color pair is readable under WCAG 2.
+
+        Use this for accessibility checks. For converting a single color use convert_color.
+        Returns: contrast ratio and pass/fail for AA and AAA (normal and large text) and UI components.
+        Behavior: computed locally. Cost: $0.001 per successful call."""
+        return await _call("/v1/color/contrast", {"foreground": foreground, "background": background},
+                           "check-tool")
+
+    @server.tool(title="Inspect Unicode text", annotations=local)
+    async def inspect_unicode(text: Annotated[str, Field(description="Text to inspect, up to 2,000 characters")]) -> dict:
+        """Show exactly which Unicode characters a string contains.
+
+        Use this to find invisible or look-alike characters, count characters the way users see them, or
+        check normalization before comparing strings.
+        Returns: length in code points, graphemes (user-perceived characters), UTF-8 bytes and UTF-16 units;
+        NFC/NFD/NFKC/NFKD forms; and per character the code point, name, category, UTF-8 bytes and HTML entity.
+        Behavior: computed locally. Cost: $0.001 per successful call."""
+        return await _call("/v1/unicode", {"text": text}, "check-tool", body=True)
+
+    @server.tool(title="Convert time between time zones", annotations=local)
+    async def convert_timezone(
+        from_timezone: Annotated[str, Field(description="Source IANA time zone, e.g. Asia/Seoul")],
+        to_timezones: Annotated[str, Field(description="Target IANA time zones, comma-separated (up to 50), e.g. Europe/London,America/New_York")],
+        time: Annotated[str | None, Field(description="ISO 8601 time in the source zone, e.g. 2026-10-03T09:00; defaults to now")] = None,
+    ) -> dict:
+        """Convert one moment from a time zone to others.
+
+        Use this to schedule across time zones. For valid zone names use list_timezones.
+        Returns: source and each target with local date-time, weekday, UTC offset, abbreviation and whether
+        daylight saving is in effect, plus UTC and Unix time.
+        Behavior: computed locally with the IANA database. Cost: $0.001 per successful call."""
+        return await _call("/v1/timezone/convert", {"from": from_timezone, "to": to_timezones, "time": time},
+                           "check-tool")
+
+    @server.tool(title="List IANA time zones", annotations=local)
+    async def list_timezones(region: Annotated[str | None, Field(description="Optional region prefix, e.g. Europe, Asia or America")] = None) -> dict:
+        """List valid IANA time zone names.
+
+        Use this to find the exact zone name before calling convert_timezone or parse_cron.
+        Returns: count and timezones (sorted names).
+        Behavior: computed locally. Cost: $0.001 per successful call."""
+        return await _call("/v1/timezone/list", {"region": region}, "check-tool")
+
+    # ── Hyperliquid market data ──
+    @server.tool(title="Hyperliquid perpetual markets", annotations=web)
+    async def hyperliquid_markets(
+        coin: Annotated[str | None, Field(description="One or more coins, comma-separated, e.g. BTC,ETH; omit for all markets")] = None,
+        sort: Annotated[str, Field(description="Sort by volume, open_interest, funding, change or coin")] = "volume",
+        order: Annotated[str, Field(description="asc or desc")] = "desc",
+        limit: Annotated[int, Field(ge=1, le=300, description="Maximum markets to return, 1-300")] = 50,
+    ) -> dict:
+        """Get current Hyperliquid perpetual futures markets.
+
+        Use this for prices, funding rates or open interest right now. For history use
+        hyperliquid_funding_history or hyperliquid_candles.
+        Returns: per market mark/oracle/mid price, 24h change, hourly and annualized funding (%), premium,
+        open interest (coins and USD), 24h volume and max leverage; not_found lists unknown coins.
+        Behavior: reads Hyperliquid's public market data (refreshed every 10 s). Not financial advice.
+        Cost: $0.001 per successful call."""
+        return await _call("/v1/hyperliquid/markets", {"coin": coin, "sort": sort, "order": order,
+                                                       "limit": limit}, "check-tool")
+
+    @server.tool(title="Hyperliquid funding history", annotations=web)
+    async def hyperliquid_funding_history(
+        coin: Annotated[str, Field(description="Coin symbol, e.g. BTC")],
+        hours: Annotated[int, Field(ge=1, le=720, description="How many hours back, 1-720 (30 days)")] = 24,
+    ) -> dict:
+        """Get the hourly funding rate history of one Hyperliquid perpetual.
+
+        Use this to judge funding trends or carry. For current rates across markets use hyperliquid_markets.
+        Returns: hourly funding_rate and premium points, average hourly and annualized rate, cumulative rate.
+        Behavior: reads Hyperliquid's public data. Cost: $0.001 per successful call."""
+        return await _call("/v1/hyperliquid/funding", {"coin": coin, "hours": hours}, "check-tool")
+
+    @server.tool(title="Hyperliquid candles (OHLCV)", annotations=web)
+    async def hyperliquid_candles(
+        coin: Annotated[str, Field(description="Coin symbol, e.g. ETH")],
+        interval: Annotated[str, Field(description="Candle interval: 1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d 3d 1w")] = "1h",
+        limit: Annotated[int, Field(ge=1, le=500, description="Number of most recent candles, 1-500")] = 100,
+    ) -> dict:
+        """Get OHLCV price candles for one Hyperliquid perpetual.
+
+        Use this for charts or technical analysis. For current price and funding use hyperliquid_markets.
+        Returns: candles with open_time, close_time, open, high, low, close, volume and trade count.
+        Behavior: reads Hyperliquid's public data. Cost: $0.001 per successful call."""
+        return await _call("/v1/hyperliquid/candles", {"coin": coin, "interval": interval, "limit": limit},
+                           "check-tool")
 
     @server.custom_route("/", methods=["GET"])
     async def root(_: Request) -> JSONResponse:
