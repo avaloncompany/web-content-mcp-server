@@ -15,9 +15,12 @@ import uvicorn
 from apify import Actor
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.utilities.json_schema import compress_schema
 from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from .schemas import OUTPUT_MODELS
 
 API_BASE = os.environ.get("WCAPI_BASE", "https://api.avaloncompany.ai")
 #: 웹 도구 공통 인자. 모듈 최상단에 둬야 한다 -- annotations 가 지연 평가라 함수 안 별칭은 풀리지 않는다.
@@ -67,8 +70,17 @@ def build_server() -> FastMCP:
     web = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
     local = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 
+    def tool(**kwargs):
+        """server.tool 에 그 도구의 출력 스키마(schemas.OUTPUT_MODELS)를 붙인다. 모델이 없는 도구는 등록 시점에 실패한다.
+
+        응답 dict 는 그대로 structuredContent 로 나간다 -- 반환 타입은 dict 로 두고 스키마만 명시한다."""
+        def register(fn):
+            schema = OUTPUT_MODELS[fn.__name__].model_json_schema(mode="serialization")
+            return server.tool(output_schema=compress_schema(schema, prune_titles=True), **kwargs)(fn)
+        return register
+
     # ── Page tools: read one page ──
-    @server.tool(title="Web page to Markdown", annotations=web)
+    @tool(title="Web page to Markdown", annotations=web)
     async def to_markdown(
         url: URL,
         include_links: Annotated[bool, Field(description="Keep hyperlinks as [text](url) in the Markdown")] = True,
@@ -87,7 +99,7 @@ def build_server() -> FastMCP:
                                             "include_tables": include_tables,
                                             "main_content_only": main_content_only}, "page-tool")
 
-    @server.tool(title="URL metadata and Open Graph", annotations=web)
+    @tool(title="URL metadata and Open Graph", annotations=web)
     async def get_metadata(url: URL) -> dict:
         """Get a page's link-preview metadata without its body text.
 
@@ -99,7 +111,7 @@ def build_server() -> FastMCP:
         Behavior: fetches the URL once (no JavaScript). Cost: $0.003 per successful call; errors are free."""
         return await _call("/v1/metadata", {"url": url}, "page-tool")
 
-    @server.tool(title="Page structure as JSON", annotations=web)
+    @tool(title="Page structure as JSON", annotations=web)
     async def extract_structure(url: URL) -> dict:
         """Extract a page's structure as JSON: heading outline, links, images, tables and JSON-LD.
 
@@ -109,7 +121,7 @@ def build_server() -> FastMCP:
         Behavior: fetches the URL once (no JavaScript). Cost: $0.003 per successful call; errors are free."""
         return await _call("/v1/extract", {"url": url}, "page-tool")
 
-    @server.tool(title="Detect website technologies", annotations=web)
+    @tool(title="Detect website technologies", annotations=web)
     async def detect_technologies(url: URL) -> dict:
         """Detect the technology stack behind a website.
 
@@ -120,7 +132,7 @@ def build_server() -> FastMCP:
         call; errors are free."""
         return await _call("/v1/tech", {"url": url}, "page-tool")
 
-    @server.tool(title="SEO audit of a page", annotations=web)
+    @tool(title="SEO audit of a page", annotations=web)
     async def audit_seo(url: URL) -> dict:
         """Audit one page's on-page SEO and list what to fix, most important first.
 
@@ -131,7 +143,7 @@ def build_server() -> FastMCP:
         Behavior: fetches the page plus robots.txt and the sitemap. Cost: $0.003 per successful call."""
         return await _call("/v1/seo-audit", {"url": url}, "page-tool")
 
-    @server.tool(title="Check links on a page", annotations=web)
+    @tool(title="Check links on a page", annotations=web)
     async def check_broken_links(
         url: URL,
         max_links: Annotated[int, Field(ge=1, le=100, description="How many links to test, 1-100")] = 50,
@@ -149,7 +161,7 @@ def build_server() -> FastMCP:
                                                 "include_external": include_external}, "page-tool")
 
     # ── Check tools: one quick check ──
-    @server.tool(title="Trace redirects / unshorten URL", annotations=web)
+    @tool(title="Trace redirects / unshorten URL", annotations=web)
     async def trace_redirects(url: Annotated[str, Field(description="URL to follow, including short links such as https://bit.ly/abc")]) -> dict:
         """Follow every redirect hop of a URL to its final destination.
 
@@ -160,7 +172,7 @@ def build_server() -> FastMCP:
         Behavior: requests each hop without downloading page bodies. Cost: $0.001 per successful call."""
         return await _call("/v1/redirects", {"url": url}, "check-tool")
 
-    @server.tool(title="Check SSL/TLS certificate", annotations=web)
+    @tool(title="Check SSL/TLS certificate", annotations=web)
     async def check_ssl(host: Annotated[str, Field(description="Domain or https URL, e.g. example.com (port 443)")]) -> dict:
         """Check a domain's TLS certificate on port 443.
 
@@ -172,7 +184,7 @@ def build_server() -> FastMCP:
         Behavior: opens one TLS connection. Cost: $0.001 per successful call; errors are free."""
         return await _call("/v1/ssl", {"host": host}, "check-tool")
 
-    @server.tool(title="Grade security headers", annotations=web)
+    @tool(title="Grade security headers", annotations=web)
     async def grade_security_headers(url: URL) -> dict:
         """Grade a website's HTTP security headers from A+ to F.
 
@@ -183,7 +195,7 @@ def build_server() -> FastMCP:
         Behavior: one request for the response headers. Cost: $0.001 per successful call."""
         return await _call("/v1/security-headers", {"url": url}, "check-tool")
 
-    @server.tool(title="Parse robots.txt", annotations=web)
+    @tool(title="Parse robots.txt", annotations=web)
     async def parse_robots(
         url: Annotated[str, Field(description="Any URL on the site; its /robots.txt is read")],
         path: Annotated[str | None, Field(description="Optional path to test, e.g. /private/page")] = None,
@@ -199,7 +211,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/robots", {"url": url, "path": path, "user_agent": user_agent},
                            "check-tool")
 
-    @server.tool(title="Parse XML sitemap", annotations=web)
+    @tool(title="Parse XML sitemap", annotations=web)
     async def parse_sitemap(url: Annotated[str, Field(description="Sitemap URL, or a site URL to discover the sitemap from robots.txt and common paths")]) -> dict:
         """List the URLs in a site's XML sitemap.
 
@@ -210,7 +222,7 @@ def build_server() -> FastMCP:
         Behavior: fetches the sitemap (discovering it if needed). Cost: $0.001 per successful call."""
         return await _call("/v1/sitemap", {"url": url}, "check-tool")
 
-    @server.tool(title="Domain WHOIS and DNS lookup", annotations=web)
+    @tool(title="Domain WHOIS and DNS lookup", annotations=web)
     async def lookup_domain(domain: Annotated[str, Field(description="Domain or URL, e.g. example.com")]) -> dict:
         """Look up a domain's registration (RDAP/WHOIS) and DNS records.
 
@@ -221,7 +233,7 @@ def build_server() -> FastMCP:
         Behavior: RDAP and DNS queries only, no web page fetch. Cost: $0.001 per successful call."""
         return await _call("/v1/domain", {"domain": domain}, "check-tool")
 
-    @server.tool(title="Read RSS/Atom feed", annotations=web)
+    @tool(title="Read RSS/Atom feed", annotations=web)
     async def read_feed(url: Annotated[str, Field(description="Feed URL, or a website URL to discover its feed")]) -> dict:
         """Read an RSS, Atom or RDF feed as JSON.
 
@@ -232,7 +244,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/feed", {"url": url}, "check-tool")
 
     # ── Diagnostics ──
-    @server.tool(title="Email domain health check", annotations=web)
+    @tool(title="Email domain health check", annotations=web)
     async def check_email_domain(
         domain: Annotated[str, Field(description="Domain or email address, e.g. example.com or info@example.com")],
         dkim_selector: Annotated[str | None, Field(description="Your DKIM selector(s), comma-separated, up to 5 (common selectors are always tried)")] = None,
@@ -246,7 +258,7 @@ def build_server() -> FastMCP:
         Behavior: DNS queries plus the MTA-STS policy file. Cost: $0.003 per successful call."""
         return await _call("/v1/email-domain", {"domain": domain, "dkim_selector": dkim_selector}, "page-tool")
 
-    @server.tool(title="Analyze SAML metadata", annotations=web)
+    @tool(title="Analyze SAML metadata", annotations=web)
     async def analyze_saml_metadata(
         xml: Annotated[str | None, Field(description="SAML 2.0 metadata XML text (give this or url)")] = None,
         url: Annotated[str | None, Field(description="Public metadata URL (give this or xml)")] = None,
@@ -265,7 +277,7 @@ def build_server() -> FastMCP:
             return await _call("/v1/saml/metadata", {"url": url}, "check-tool")
         return await _call("/v1/saml/metadata", {}, "check-tool", xml=xml)
 
-    @server.tool(title="Check OpenID Connect provider", annotations=web)
+    @tool(title="Check OpenID Connect provider", annotations=web)
     async def check_oidc_provider(issuer: Annotated[str, Field(description="Issuer URL, e.g. https://accounts.google.com")]) -> dict:
         """Check an OpenID Connect provider's discovery document and signing keys.
 
@@ -278,7 +290,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/oidc", {"issuer": issuer}, "check-tool")
 
     # ── Developer tools: computed locally, no web access ──
-    @server.tool(title="Explain a cron expression", annotations=local)
+    @tool(title="Explain a cron expression", annotations=local)
     async def parse_cron(
         expression: Annotated[str, Field(description="Cron expression: 5 fields (min hour day month weekday), 6 with seconds, or @daily/@hourly/@weekly/@monthly/@yearly")],
         count: Annotated[int, Field(ge=1, le=50, description="How many upcoming run times to list, 1-50")] = 5,
@@ -294,7 +306,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/cron", {"expression": expression, "count": count, "timezone": timezone,
                                         "start": start}, "check-tool")
 
-    @server.tool(title="Test a regular expression", annotations=local)
+    @tool(title="Test a regular expression", annotations=local)
     async def test_regex(
         pattern: Annotated[str, Field(description="Regular expression (Python/PCRE syntax), up to 2,000 characters")],
         text: Annotated[str, Field(description="Text to search, up to 100,000 characters")],
@@ -311,7 +323,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/regex", {"pattern": pattern, "text": text, "flags": flags,
                                          "replacement": replacement}, "check-tool", body=True)
 
-    @server.tool(title="Convert a color", annotations=local)
+    @tool(title="Convert a color", annotations=local)
     async def convert_color(color: Annotated[str, Field(description="Color as #hex, rgb(), hsl() or a CSS name, e.g. #ff6347 or tomato")]) -> dict:
         """Convert one color between formats and suggest matching palettes.
 
@@ -322,7 +334,7 @@ def build_server() -> FastMCP:
         Behavior: computed locally. Cost: $0.001 per successful call."""
         return await _call("/v1/color", {"color": color}, "check-tool")
 
-    @server.tool(title="Check color contrast (WCAG)", annotations=local)
+    @tool(title="Check color contrast (WCAG)", annotations=local)
     async def check_color_contrast(
         foreground: Annotated[str, Field(description="Text color as #hex, rgb(), hsl() or CSS name")],
         background: Annotated[str, Field(description="Background color as #hex, rgb(), hsl() or CSS name")],
@@ -335,7 +347,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/color/contrast", {"foreground": foreground, "background": background},
                            "check-tool")
 
-    @server.tool(title="Inspect Unicode text", annotations=local)
+    @tool(title="Inspect Unicode text", annotations=local)
     async def inspect_unicode(text: Annotated[str, Field(description="Text to inspect, up to 2,000 characters")]) -> dict:
         """Show exactly which Unicode characters a string contains.
 
@@ -346,7 +358,7 @@ def build_server() -> FastMCP:
         Behavior: computed locally. Cost: $0.001 per successful call."""
         return await _call("/v1/unicode", {"text": text}, "check-tool", body=True)
 
-    @server.tool(title="Convert time between time zones", annotations=local)
+    @tool(title="Convert time between time zones", annotations=local)
     async def convert_timezone(
         from_timezone: Annotated[str, Field(description="Source IANA time zone, e.g. Asia/Seoul")],
         to_timezones: Annotated[str, Field(description="Target IANA time zones, comma-separated (up to 50), e.g. Europe/London,America/New_York")],
@@ -361,7 +373,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/timezone/convert", {"from": from_timezone, "to": to_timezones, "time": time},
                            "check-tool")
 
-    @server.tool(title="List IANA time zones", annotations=local)
+    @tool(title="List IANA time zones", annotations=local)
     async def list_timezones(region: Annotated[str | None, Field(description="Optional region prefix, e.g. Europe, Asia or America")] = None) -> dict:
         """List valid IANA time zone names.
 
@@ -371,7 +383,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/timezone/list", {"region": region}, "check-tool")
 
     # ── Hyperliquid market data ──
-    @server.tool(title="Hyperliquid perpetual markets", annotations=web)
+    @tool(title="Hyperliquid perpetual markets", annotations=web)
     async def hyperliquid_markets(
         coin: Annotated[str | None, Field(description="One or more coins, comma-separated, e.g. BTC,ETH; omit for all markets")] = None,
         sort: Annotated[str, Field(description="Sort by volume, open_interest, funding, change or coin")] = "volume",
@@ -389,7 +401,7 @@ def build_server() -> FastMCP:
         return await _call("/v1/hyperliquid/markets", {"coin": coin, "sort": sort, "order": order,
                                                        "limit": limit}, "check-tool")
 
-    @server.tool(title="Hyperliquid funding history", annotations=web)
+    @tool(title="Hyperliquid funding history", annotations=web)
     async def hyperliquid_funding_history(
         coin: Annotated[str, Field(description="Coin symbol, e.g. BTC")],
         hours: Annotated[int, Field(ge=1, le=720, description="How many hours back, 1-720 (30 days)")] = 24,
@@ -401,7 +413,7 @@ def build_server() -> FastMCP:
         Behavior: reads Hyperliquid's public data. Cost: $0.001 per successful call."""
         return await _call("/v1/hyperliquid/funding", {"coin": coin, "hours": hours}, "check-tool")
 
-    @server.tool(title="Hyperliquid candles (OHLCV)", annotations=web)
+    @tool(title="Hyperliquid candles (OHLCV)", annotations=web)
     async def hyperliquid_candles(
         coin: Annotated[str, Field(description="Coin symbol, e.g. ETH")],
         interval: Annotated[str, Field(description="Candle interval: 1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d 3d 1w")] = "1h",
